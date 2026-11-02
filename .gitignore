@@ -1,0 +1,22 @@
+# Generated at runtime — NEVER commit these
+server.crt
+server.key
+c2.db
+c2.db-journal
+c2.db-wal
+loot/
+agent_payload.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
