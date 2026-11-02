@@ -1,6 +1,1 @@
 cryptography>=42.0
-flask>=3.0
-werkzeug>=3.0
-requests>=2.31
-pillow>=10.0
-pynput>=1.7
