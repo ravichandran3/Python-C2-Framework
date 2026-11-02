@@ -1,52 +1,35 @@
-"""Shared crypto, framing, and default malleable profile."""
-import os, struct
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+"""Shared helpers for server, operator, stager. Pure stdlib."""
+import hashlib
+import json
+import socket
+import ssl
+import struct
+
+PROTOCOL_VERSION = "1"
 
 DEFAULT_PROFILE = {
     "name": "default",
-    "user_agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
     "register_uri": "/api/v1/auth/login",
-    "beacon_uri":   "/api/v1/auth/refresh",
-    "result_uri":   "/api/v1/auth/verify",
+    "beacon_uri": "/api/v1/auth/refresh",
+    "result_uri": "/api/v1/auth/verify",
     "headers": {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
     },
 }
-
-
-def aes_encrypt(key: bytes, data: bytes) -> bytes:
-    nonce = os.urandom(12)
-    return nonce + AESGCM(key).encrypt(nonce, data, None)
-
-
-def aes_decrypt(key: bytes, data: bytes) -> bytes:
-    return AESGCM(key).decrypt(data[:12], data[12:], None)
-
-
-def rsa_encrypt(pub, data: bytes) -> bytes:
-    return pub.encrypt(data, padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-        algorithm=hashes.SHA256(), label=None))
-
-
-def rsa_decrypt(priv, data: bytes) -> bytes:
-    return priv.decrypt(data, padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-        algorithm=hashes.SHA256(), label=None))
 
 
 def recv_exact(sock, n):
     buf = b""
     while len(buf) < n:
-        c = sock.recv(n - len(buf))
-        if not c:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
             return None
-        buf += c
+        buf += chunk
     return buf
 
 
@@ -54,9 +37,48 @@ def recv_msg(sock):
     hdr = recv_exact(sock, 4)
     if not hdr:
         return None
-    n = struct.unpack(">I", hdr)[0]
-    return recv_exact(sock, n)
+    length = struct.unpack(">I", hdr)[0]
+    if length == 0 or length > 64 * 1024 * 1024:
+        return None
+    return recv_exact(sock, length)
 
 
 def send_msg(sock, data: bytes):
     sock.sendall(struct.pack(">I", len(data)) + data)
+
+
+def cert_fingerprint(sock):
+    """SHA-256 hex of peer DER cert."""
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        raise ssl.SSLError("no peer certificate")
+    return hashlib.sha256(der).hexdigest()
+
+
+def normalize_fp(fp):
+    if not fp:
+        return ""
+    return fp.lower().replace(":", "").replace("sha256:", "").strip()
+
+
+def make_client_ctx():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def make_server_ctx(cert_path, key_path):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+def json_dumps(obj):
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def json_loads(data):
+    return json.loads(data.decode() if isinstance(data, bytes) else data)
